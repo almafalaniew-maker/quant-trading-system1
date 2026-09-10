@@ -33,6 +33,30 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     return df[REQUIRED_COLUMNS].sort_index()
 
 
+def drop_invalid_bars(df: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
+    """Remove bars whose OHLC cannot be traded as stated.
+
+    The backtester fills stops and targets from a bar's high and low, so a bar
+    whose low sits above its own open is not merely untidy - it would let the
+    engine fill at a price that never existed. IPO days are the usual source:
+    the printed open is an offering reference rather than a traded price.
+    """
+    body_high = df[["open", "close"]].max(axis=1)
+    body_low = df[["open", "close"]].min(axis=1)
+    valid = (
+        (df["high"] >= body_high - 1e-6)
+        & (df["low"] <= body_low + 1e-6)
+        & (df["high"] >= df["low"])
+        & (df[["open", "high", "low", "close"]] > 0).all(axis=1)
+        & (df["volume"] >= 0)
+    )
+    dropped = int((~valid).sum())
+    if dropped:
+        stamps = ", ".join(str(d.date()) for d in df.index[~valid][:3])
+        print(f"  note: dropped {dropped} untradeable bar(s) from {symbol} ({stamps})")
+    return df[valid]
+
+
 def load_csv_dir(directory: str | Path, symbols: list[str] | None = None) -> dict[str, pd.DataFrame]:
     """Load `<SYMBOL>.csv` files of daily bars from a directory."""
     directory = Path(directory)
@@ -41,7 +65,7 @@ def load_csv_dir(directory: str | Path, symbols: list[str] | None = None) -> dic
         symbol = path.stem.upper()
         if symbols and symbol not in symbols:
             continue
-        frames[symbol] = _normalise(pd.read_csv(path))
+        frames[symbol] = drop_invalid_bars(_normalise(pd.read_csv(path)), symbol)
     if not frames:
         raise FileNotFoundError(f"no CSV bars found in {directory}")
     return frames
