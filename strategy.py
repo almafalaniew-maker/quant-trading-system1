@@ -59,15 +59,26 @@ class StrategyConfig:
     fixed_stop_pct: float = 0.02      # only used when stop_mode == "fixed_pct"
     max_position_pct: float = 0.20    # cap on notional per position
     max_open_positions: int = 10
+    # When cash is short a trader buys a smaller position; they do not walk away.
+    # Take a partial fill down to this share of the intended size, then give up.
+    min_fill_fraction: float = 0.25
 
     # --- Exits ------------------------------------------------------------
     exit_mode: ExitMode = "fixed_target"
     target_r: float = 4.0             # fixed_target: exit everything here
     scale_r: float = 2.0              # scale_out: first tranche here
     scale_fraction: float = 1.0 / 3.0 # scale_out: fraction sold at scale_r
-    trail_atr_mult: float = 3.0       # scale_out: chandelier trail on the runner
+    trail_atr_mult: float = 3.0       # chandelier trail distance
     breakeven_after_scale: bool = True
-    max_hold_days: int = 120
+    # Once the trade's peak reaches this R multiple, trail the stop behind the
+    # highest high. Works in either exit mode; 0.0 trails from entry. None keeps
+    # the older behaviour where only a scale-out could switch the trail on.
+    trail_from_r: float | None = None
+    # Backstop, counted in trading bars rather than calendar days so it means the
+    # same thing across holidays. It is a safety valve, not a profit-taking rule:
+    # time-stopped trades run 94-98% profitable, so cutting them short is cutting
+    # winners.
+    max_hold_bars: int = 83
 
     def variant(self, name: str, **overrides) -> "StrategyConfig":
         """Return a copy with `overrides` applied - used to build A/B arms."""

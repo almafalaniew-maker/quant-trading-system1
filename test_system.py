@@ -255,6 +255,99 @@ def test_costs_reduce_returns():
           f"{dear.total_return:.4f} vs {free.total_return:.4f}")
 
 
+def test_zero_scale_fraction_sells_nothing():
+    """scale_fraction=0 means no tranche - not one share rounded up."""
+    cfg = StrategyConfig(exit_mode="scale_out", scale_fraction=0.0, scale_r=2.0,
+                         trail_from_r=None)
+    engine = frictionless(cfg)
+    position = fresh_position()               # entry 100, 1R = $2, 100 shares
+    engine._manage_position(position, bar(100.0, 106.0, 99.0, 105.0, atr=1.0),
+                            pd.Timestamp("2020-01-02"))
+    check("zero scale fraction sells no shares",
+          position.open_shares == 100 and not position.legs,
+          f"{position.open_shares} left, {len(position.legs)} leg(s)")
+
+
+def test_trail_from_entry_protects_a_trade_that_never_reaches_2r():
+    """A run to 1.9R that rolls over should not ride the original stop down.
+
+    With the trail armed from entry, the stop follows the highest high; without
+    it the trade gives back the whole move and stops out at -1R.
+    """
+    d = pd.Timestamp("2020-01-02")
+    bars = [bar(100.0, 103.5, 99.5, 103.0, atr=0.5),   # runs to 1.75R
+            bar(103.0, 103.8, 96.0, 96.5, atr=0.5)]    # rolls straight over
+
+    trailed = frictionless(StrategyConfig(exit_mode="fixed_target", target_r=4.0,
+                                          trail_from_r=0.0, trail_atr_mult=3.0))
+    p_trail = fresh_position()
+    for i, b in enumerate(bars):
+        trailed._manage_position(p_trail, b, d + pd.Timedelta(days=i))
+    r_trail = p_trail.realised_pnl / p_trail.initial_risk_dollars
+
+    plain = frictionless(StrategyConfig(exit_mode="fixed_target", target_r=4.0))
+    p_plain = fresh_position()
+    for i, b in enumerate(bars):
+        plain._manage_position(p_plain, b, d + pd.Timedelta(days=i))
+    r_plain = p_plain.realised_pnl / p_plain.initial_risk_dollars
+
+    check("trail from entry beats riding the original stop down",
+          r_trail > r_plain and r_plain < 0, f"trailed {r_trail:+.2f}R vs plain {r_plain:+.2f}R")
+
+
+def test_trail_arms_only_after_its_threshold():
+    cfg = StrategyConfig(exit_mode="fixed_target", trail_from_r=2.0, trail_atr_mult=1.0)
+    engine = frictionless(cfg)
+    position = fresh_position()               # 1R = $2, so 2R peak needs a 104 high
+    engine._manage_position(position, bar(100.0, 103.0, 99.0, 102.0, atr=1.0),
+                            pd.Timestamp("2020-01-02"))
+    below = position.trailing
+    engine._manage_position(position, bar(102.0, 105.0, 101.0, 104.0, atr=1.0),
+                            pd.Timestamp("2020-01-03"))
+    check("trail stays off below its threshold and arms above it",
+          (not below) and position.trailing, f"below={below} above={position.trailing}")
+
+
+def test_short_cash_takes_a_smaller_position():
+    """A cash-short account buys what it can afford rather than skipping."""
+    universe, benchmarks = data.synthetic_universe(n_symbols=30, days=700, seed=31)
+    cfg = StrategyConfig(risk_pct=0.015, min_fill_fraction=0.25)
+    _, _, greedy = run_config(cfg, universe, benchmarks, starting_equity=40_000.0)
+    strict = StrategyConfig(risk_pct=0.015, min_fill_fraction=1.01)   # never partial
+    _, _, refused = run_config(strict, universe, benchmarks, starting_equity=40_000.0)
+    check("partial fills recover entries that would have been dropped",
+          len(greedy) > len(refused), f"{len(greedy)} vs {len(refused)} trades")
+
+
+def test_partial_fill_keeps_r_accounting_honest():
+    """A position sized down must have its 1R restated, or every R is wrong."""
+    universe, benchmarks = data.synthetic_universe(n_symbols=25, days=600, seed=37)
+    cfg = StrategyConfig(risk_pct=0.02)
+    _, _, blotter = run_config(cfg, universe, benchmarks, starting_equity=30_000.0)
+    if blotter.empty:
+        check("partial-fill R accounting", True)
+        return
+    implied = blotter["pnl"] / (blotter["shares"] * blotter["risk_per_share"])
+    check("R multiples reconcile after partial fills",
+          bool(np.allclose(blotter["r_multiple"], implied)))
+
+
+def test_hold_limit_counts_bars_not_calendar_days():
+    """Counting calendar days makes the limit drift with holidays and weekends."""
+    cfg = StrategyConfig(exit_mode="fixed_target", max_hold_bars=3, target_r=99.0)
+    engine = frictionless(cfg)
+    position = fresh_position()
+    # Bars a week apart: 4 bars is 21 calendar days but only 4 sessions.
+    d = pd.Timestamp("2020-01-02")
+    for i in range(4):
+        engine._manage_position(position, bar(100.0, 100.5, 99.5, 100.0, atr=1.0),
+                                d + pd.Timedelta(days=7 * i))
+    check("hold limit fires on the 3rd bar regardless of the calendar",
+          position.open_shares == 0 and position.legs[-1].reason == "time_stop",
+          f"{position.open_shares} left, last leg "
+          f"{position.legs[-1].reason if position.legs else 'none'}")
+
+
 def main() -> int:
     tests = [
         test_no_lookahead,
@@ -271,6 +364,12 @@ def main() -> int:
         test_regime_gate_blocks_entries,
         test_portfolio_accounting,
         test_costs_reduce_returns,
+        test_zero_scale_fraction_sells_nothing,
+        test_trail_from_entry_protects_a_trade_that_never_reaches_2r,
+        test_trail_arms_only_after_its_threshold,
+        test_short_cash_takes_a_smaller_position,
+        test_partial_fill_keeps_r_accounting_honest,
+        test_hold_limit_counts_bars_not_calendar_days,
     ]
     for test in tests:
         print(f"\n{test.__name__}")

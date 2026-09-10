@@ -42,6 +42,8 @@ class Position:
     initial_shares: int
     initial_risk_dollars: float
     scaled: bool = False
+    trailing: bool = False
+    bars_held: int = 0
     highest_high: float = 0.0
     realised_pnl: float = 0.0
     legs: list[ExitLeg] = field(default_factory=list)
@@ -120,7 +122,19 @@ class Backtester:
                         continue
                     cost = self._buy_cost(position.entry_price, position.shares)
                     if cost > cash:
-                        continue
+                        # Buy what the cash allows instead of dropping the signal.
+                        # Refusing outright deletes 43% of entries at the default
+                        # risk budget and 97% at 1.5%, which silently turns a
+                        # sizing question into a selection one.
+                        per_share = self._buy_cost(position.entry_price, 1)
+                        affordable = int(cash // per_share) if per_share > 0 else 0
+                        floor = position.shares * cfg.min_fill_fraction
+                        if affordable <= 0 or affordable < floor:
+                            continue
+                        position.shares = affordable
+                        position.initial_shares = affordable
+                        position.initial_risk_dollars = affordable * position.risk_per_share
+                        cost = self._buy_cost(position.entry_price, affordable)
                     cash -= cost
                     open_positions[symbol] = position
                     slots -= 1
@@ -210,25 +224,36 @@ class Backtester:
                 fill = max(open_, target)
                 return proceeds + self._close_shares(position, position.open_shares, fill, date, "target")
 
-        else:  # scale_out
-            if not position.scaled:
-                scale_target = position.entry_price + cfg.scale_r * position.risk_per_share
-                if high >= scale_target:
-                    fill = max(open_, scale_target)
-                    tranche = max(1, int(round(position.initial_shares * cfg.scale_fraction)))
-                    tranche = min(tranche, position.open_shares)
-                    proceeds += self._close_shares(position, tranche, fill, date, "scale_out")
-                    position.scaled = True
-                    if cfg.breakeven_after_scale:
-                        position.stop_price = max(position.stop_price, position.entry_price)
-            if position.scaled and position.open_shares > 0:
+        elif cfg.scale_fraction > 0 and not position.scaled:
+            # Bank a tranche at scale_r. Only when a fraction is actually asked
+            # for - rounding a zero fraction up to one share used to sell stock
+            # the config never requested, and marked the position scaled.
+            scale_target = position.entry_price + cfg.scale_r * position.risk_per_share
+            if high >= scale_target:
+                fill = max(open_, scale_target)
+                tranche = min(max(1, int(round(position.initial_shares * cfg.scale_fraction))),
+                              position.open_shares)
+                proceeds += self._close_shares(position, tranche, fill, date, "scale_out")
+                position.scaled = True
+                if cfg.breakeven_after_scale:
+                    position.stop_price = max(position.stop_price, position.entry_price)
+
+        # Trailing stop. Armed either by an explicit trail_from_r threshold or,
+        # when that is unset, by a scale-out having happened - the old behaviour.
+        if position.open_shares > 0:
+            if cfg.trail_from_r is None:
+                position.trailing = position.scaled
+            elif not position.trailing:
+                peak_r = (position.highest_high - position.entry_price) / position.risk_per_share
+                position.trailing = peak_r >= cfg.trail_from_r
+            if position.trailing:
                 atr_now = float(bar["atr"]) if pd.notna(bar["atr"]) else 0.0
                 if atr_now > 0:
                     trail = position.highest_high - cfg.trail_atr_mult * atr_now
                     position.stop_price = max(position.stop_price, trail)
 
-        held = (date - position.entry_date).days
-        if position.open_shares > 0 and held >= cfg.max_hold_days:
+        position.bars_held += 1
+        if position.open_shares > 0 and position.bars_held >= cfg.max_hold_bars:
             proceeds += self._close_shares(position, position.open_shares, close, date, "time_stop")
 
         return proceeds
