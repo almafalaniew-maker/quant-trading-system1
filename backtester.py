@@ -84,9 +84,18 @@ class Backtester:
         self,
         universe: dict[str, pd.DataFrame],
         benchmarks: dict[str, pd.DataFrame],
+        prepared: dict[str, pd.DataFrame] | None = None,
     ) -> tuple[pd.Series, pd.DataFrame]:
+        """Run the config over `universe`.
+
+        `prepared` accepts frames whose indicators were computed once elsewhere -
+        a walk-forward runs the same config over dozens of overlapping windows,
+        and recomputing every indicator each time dominates the runtime. The
+        frames must have been prepared with this same config.
+        """
         cfg = self.cfg
-        prepared = {sym: prepare_symbol(df, cfg) for sym, df in universe.items()}
+        if prepared is None:
+            prepared = {sym: prepare_symbol(df, cfg) for sym, df in universe.items()}
         regime = regime_series(benchmarks, cfg)
         calendar = benchmarks["SPY"].index
 
