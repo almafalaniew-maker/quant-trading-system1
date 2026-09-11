@@ -17,6 +17,7 @@ behaviour cannot quietly drift away from what was tested.
 | `data.py` | CSV / yfinance loaders and a synthetic generator for tests |
 | `ab_test.py` | Runs the baseline against one-change-at-a-time variants |
 | `trade_executor.py` | Live/paper execution, dry-run by default |
+| `run_session.py` | One entry point: manage, then scan. What a scheduler calls |
 | `position_manager.py` | Reconciles open positions, trails stops, applies the time stop |
 | `test_system.py` | Mechanics self-tests |
 
@@ -71,6 +72,30 @@ python3 position_manager.py --data ./bars --live              # acts on the acco
 It keeps state in `positions_state.json` - the broker knows the share count but
 not what defined 1R, how many bars a trade has been open, or how high it has
 run - so the file must persist between runs.
+
+### One command per session
+
+`run_session.py` sequences both steps over a single broker connection, so the
+scan sees the account as the manager just left it:
+
+```bash
+python3 run_session.py --data ./bars            # dry run
+python3 run_session.py --data ./bars --live     # acts on the account
+```
+
+Order matters and is not configurable. Management closes trades that have hit
+their time limit and frees their slots; the scan then fills only the slots that
+are genuinely free. Reversed, capital gets committed against a slot count that is
+about to change. If management fails the scan is skipped outright - opening new
+risk while the existing book is in an unknown state is the one failure this must
+never become.
+
+Everything is appended to `session.log`, because a scheduled run has nobody
+watching it. As a weekday cron entry, after the close:
+
+```cron
+30 16 * * 1-5 cd /path/to/repo && python3 run_session.py --data ./bars --live
+```
 
 All presets risk **1.0%** per trade. 1.5% and 2.0% made *less* money in every
 window tested: larger positions consume cash and crowd out later signals.

@@ -495,6 +495,85 @@ def test_state_survives_a_restart():
     check("a missing state file reads as empty", load_state(Path("/nonexistent.json")) == {})
 
 
+# ---------------------------------------------------------------------------
+# Session sequencing
+# ---------------------------------------------------------------------------
+
+def _session_fixture(tmp, bars_held=0):
+    """A one-symbol universe plus a tracked position, for sequencing tests."""
+    import position_manager as pm
+    import run_session as rs
+
+    # seed 4 / 600 days ends on a bullish regime with a live signal, so the
+    # scan actually has something to do - a bearish fixture would let the
+    # entry-tracking assertions pass without exercising anything.
+    universe, benchmarks = data.synthetic_universe(n_symbols=6, days=600, seed=4)
+    cfg = StrategyConfig(name="session-test", max_hold_bars=3)
+    prepared = {s: prepare_symbol(f, cfg) for s, f in universe.items()}
+    held = "SYM000"
+    state = {held: pm.ManagedPosition(
+        symbol=held, entry_date="2020-01-02", entry_price=50.0, shares=40,
+        risk_per_share=2.0, stop_price=48.0, highest_high=50.0, bars_held=bars_held)}
+    path = Path(tmp) / "state.json"
+    pm.save_state(state, path)
+    broker = rs.SessionDryRunBroker(equity=100_000.0, positions={held: 40})
+    return cfg, broker, universe, prepared, benchmarks, path, held
+
+
+def test_session_manages_before_it_scans():
+    """A slot freed by the time stop must be available to the same session's scan."""
+    import tempfile
+    import run_session as rs
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, broker, universe, prepared, bmarks, path, held = _session_fixture(tmp, bars_held=5)
+        code = rs.run_session(cfg, broker, universe, prepared, bmarks, path)
+        check("session completes", code == 0, f"exit {code}")
+        check("the timed-out position was closed before scanning",
+              any("at market" in a for a in broker.actions), f"{broker.actions}")
+
+
+def test_session_skips_the_scan_when_management_fails():
+    """New risk must never be opened while the existing book is in doubt."""
+    import tempfile
+    import run_session as rs
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, broker, universe, prepared, bmarks, path, held = _session_fixture(tmp)
+
+        def explode(*a, **k):
+            raise RuntimeError("broker unreachable")
+
+        broker.positions = explode
+        before = len(broker.planned)
+        code = rs.run_session(cfg, broker, universe, prepared, bmarks, path)
+        check("a management failure is reported as a failure", code == 1, f"exit {code}")
+        check("no entry is attempted after a management failure",
+              len(broker.planned) == before, f"{len(broker.planned)} planned")
+
+
+def test_session_records_new_entries_for_the_next_run():
+    import tempfile
+    import position_manager as pm
+    import run_session as rs
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, broker, universe, prepared, bmarks, path, held = _session_fixture(tmp)
+        rs.run_session(cfg, broker, universe, prepared, bmarks, path)
+        state = pm.load_state(path)
+        check("the scan actually opened something to track",
+              len(broker.planned) > 0, "no entries planned - assertions would be vacuous")
+        for plan in broker.planned:
+            if plan.symbol not in state:
+                check("every new entry is tracked for the next session", False,
+                      f"{plan.symbol} missing")
+                return
+        check("every new entry is tracked for the next session", True)
+        if broker.planned:
+            p = broker.planned[0]
+            tracked = state[p.symbol]
+            check("tracked entry carries the stop that was submitted",
+                  approx(tracked.stop_price, p.stop_price),
+                  f"{tracked.stop_price} vs {p.stop_price}")
+
+
 def main() -> int:
     tests = [
         test_no_lookahead,
@@ -525,6 +604,9 @@ def main() -> int:
         test_time_stop_closes_the_position_and_cancels_its_orders,
         test_trailing_stop_only_ever_rises,
         test_state_survives_a_restart,
+        test_session_manages_before_it_scans,
+        test_session_skips_the_scan_when_management_fails,
+        test_session_records_new_entries_for_the_next_run,
     ]
     for test in tests:
         print(f"\n{test.__name__}")

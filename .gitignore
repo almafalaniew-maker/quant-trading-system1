@@ -5,3 +5,7 @@ venv/
 bars/
 *.csv
 !requirements.txt
+
+# Runtime state and logs - per-account, never shared
+session.log
+positions_state.json
