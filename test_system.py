@@ -9,6 +9,7 @@ Run with:  python3 test_system.py
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -795,6 +796,122 @@ def test_fetch_survives_one_bad_symbol():
         check("the healthy symbol is written", (bars / "GOOD.csv").exists())
 
 
+# ---------------------------------------------------------------------------
+# CLI-backed broker
+# ---------------------------------------------------------------------------
+
+STUB = Path(__file__).parent / "testdata" / "stub_alpaca.py"
+
+
+def _broker(tmp, mode=None, live=False):
+    """An AlpacaCliBroker pointed at the stub CLI instead of the real binary."""
+    import os
+    import alpaca_cli_broker as acb
+    os.environ["STUB_LOG"] = str(Path(tmp) / "calls.log")
+    os.environ.pop("STUB_MODE", None)
+    if mode:
+        os.environ["STUB_MODE"] = mode
+    return acb.AlpacaCliBroker(acb.CliConfig(binary=str(STUB), live=live))
+
+
+def _calls(tmp):
+    path = Path(tmp) / "calls.log"
+    return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_cli_broker_reads_account_and_positions():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        b = _broker(tmp)
+        check("equity is parsed", approx(b.equity(), 150000.50), f"{b.equity()}")
+        check("positions are parsed", b.positions() == {"NVDA": 55, "MU": 20},
+              f"{b.positions()}")
+        check("open symbols derive from positions", b.open_symbols() == {"NVDA", "MU"})
+        check("the clock comes from the venue", b.clock().is_open is True)
+
+
+def test_cli_broker_classifies_orders_by_price_field():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        kinds = {o.id: o.kind for o in _broker(tmp).open_orders("NVDA")}
+        check("a stop_price order is a stop", kinds.get("o1") == "stop", f"{kinds}")
+        check("a limit_price order is a limit", kinds.get("o2") == "limit", f"{kinds}")
+
+
+def test_cli_broker_stamps_every_order_with_an_idempotency_key():
+    """Without one, a submission that times out after being accepted cannot be
+    retried safely - the retry doubles the position."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        _broker(tmp).submit_stop("NVDA", 55, 171.0)
+        posts = [c for c in _calls(tmp) if c["method"] == "POST"]
+        check("the order was submitted", len(posts) == 1, f"{len(posts)}")
+        body = json.loads(posts[0]["body"])
+        check("it carries a client_order_id",
+              body.get("client_order_id", "").startswith("qts-"), f"{body}")
+        check("the stop price is formatted for the API",
+              body["stop_price"] == "171.00", f"{body}")
+
+
+def test_cli_broker_resolves_a_duplicate_instead_of_resubmitting():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        order_id = _broker(tmp, mode="duplicate").submit_market_sell("NVDA", 55)
+        check("a 409 resolves to the existing order", order_id == "already-there",
+              str(order_id))
+        posts = [c for c in _calls(tmp) if c["method"] == "POST"]
+        check("it does not submit a second time", len(posts) == 1, f"{len(posts)} POSTs")
+
+
+def test_cli_broker_tolerates_cancelling_an_order_already_gone():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            _broker(tmp, mode="gone").cancel_order("o1")
+            check("cancelling a filled order is not an error", True)
+        except Exception as exc:
+            check("cancelling a filled order is not an error", False, str(exc))
+
+
+def test_cli_broker_auth_error_names_the_right_variable():
+    """The CLI reads ALPACA_SECRET_KEY; the Python SDK reads ALPACA_API_SECRET.
+    Getting that wrong looks exactly like a bad key, so the error must say so."""
+    import tempfile
+    import alpaca_cli_broker as acb
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            _broker(tmp, mode="auth").equity()
+            check("an auth failure raises", False, "no exception")
+        except acb.AlpacaCliError as exc:
+            check("an auth failure raises", True)
+            check("the message names ALPACA_SECRET_KEY",
+                  "ALPACA_SECRET_KEY" in str(exc), str(exc)[:120])
+
+
+def test_cli_broker_defaults_to_paper():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        _broker(tmp, live=False).equity()
+        check("paper unless explicitly live", _calls(tmp)[0]["live"] == "false",
+              str(_calls(tmp)[0]["live"]))
+    with tempfile.TemporaryDirectory() as tmp:
+        _broker(tmp, live=True).equity()
+        check("live only on the literal string true", _calls(tmp)[0]["live"] == "true",
+              str(_calls(tmp)[0]["live"]))
+
+def test_cli_broker_never_blocks_on_stdin():
+    """A GET has no body. Inheriting stdin makes the CLI wait on input that
+    never comes, which hangs a scheduled run rather than failing it."""
+    import tempfile
+    import time
+    with tempfile.TemporaryDirectory() as tmp:
+        started = time.monotonic()
+        _broker(tmp).positions()
+        check("a body-less call returns promptly",
+              time.monotonic() - started < 10,
+              f"took {time.monotonic() - started:.1f}s")
+
+
 def main() -> int:
     tests = [
         test_no_lookahead,
@@ -841,6 +958,14 @@ def main() -> int:
         test_fetch_merges_incrementally_without_duplicating,
         test_fetch_refuses_to_write_impossible_bars,
         test_fetch_survives_one_bad_symbol,
+        test_cli_broker_reads_account_and_positions,
+        test_cli_broker_classifies_orders_by_price_field,
+        test_cli_broker_stamps_every_order_with_an_idempotency_key,
+        test_cli_broker_resolves_a_duplicate_instead_of_resubmitting,
+        test_cli_broker_tolerates_cancelling_an_order_already_gone,
+        test_cli_broker_auth_error_names_the_right_variable,
+        test_cli_broker_defaults_to_paper,
+        test_cli_broker_never_blocks_on_stdin,
     ]
     for test in tests:
         print(f"\n{test.__name__}")

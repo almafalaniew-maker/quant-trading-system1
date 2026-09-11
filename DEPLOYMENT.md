@@ -47,6 +47,34 @@ $EDITOR .env
 `.env` is gitignored. **Never commit it, never paste keys into a chat, and
 rotate any key that has been anywhere it should not have been.**
 
+## Option: Alpaca's own CLI
+
+Alpaca ship a Go CLI built for agents - non-interactive, JSON out, meaningful
+exit codes, automatic retry on 429/5xx. It is a single static binary, so the
+host needs no Python broker dependency:
+
+```bash
+go install github.com/alpacahq/cli/cmd/alpaca@latest   # or: brew install alpacahq/tap/cli
+export ALPACA_API_KEY=...  ALPACA_SECRET_KEY=...       # note: SECRET_KEY, not API_SECRET
+alpaca account get --quiet                             # your buying power, one command
+```
+
+`alpaca_cli_broker.py` drives it. Two things worth knowing about how:
+
+* Every call goes through `alpaca api <METHOD> <PATH>` rather than the
+  convenience subcommands. The CLI is **alpha** and its own README warns that
+  commands, flags and output formats may change without notice; the REST paths
+  underneath are stable. A CLI release cannot silently change what an order looks
+  like.
+* Every order carries a `client_order_id`. Alpaca rejects duplicates with 409,
+  which turns the dangerous case - a submission that times out *after* being
+  accepted - from "resubmit and hope" into a question with a definite answer.
+  The Python SDK path has no equivalent protection.
+
+Also note the CLI has no confirmation prompts at all: `position close-all`
+liquidates the portfolio immediately, `order cancel-all` cancels everything
+without listing it first. Neither is used by this system.
+
 ## Check the account first
 
 Before any data or code, confirm the keys reach Alpaca and the account is
