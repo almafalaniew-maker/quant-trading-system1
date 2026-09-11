@@ -47,6 +47,23 @@ $EDITOR .env
 `.env` is gitignored. **Never commit it, never paste keys into a chat, and
 rotate any key that has been anywhere it should not have been.**
 
+## Check the account first
+
+Before any data or code, confirm the keys reach Alpaca and the account is
+tradable. This uses only the standard library, so it runs before anything is
+installed:
+
+```bash
+export ALPACA_API_KEY=...  ALPACA_API_SECRET=...
+python3 check_account.py
+```
+
+It prints equity, cash, buying power, open positions and any blocked-account
+flags, then checks the balance against the strategy's sizing. Under $25,000 the
+US pattern-day-trader rule applies and positions round to few enough shares that
+the risk budget stops being met - results drift from the backtest for reasons
+that have nothing to do with the strategy.
+
 ## First data pull
 
 `bars/` is not in the repository — it is vendor data and it is per-deployment.
