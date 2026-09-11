@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the trading session once each weekday, after the close
+
+[Timer]
+# 16:30 America/New_York - after the 16:00 close, so the last daily bar is
+# final. The strategy decides once per day on completed bars; running it more
+# often does not make it trade more, it just risks acting on an unfinished bar.
+OnCalendar=Mon..Fri 16:30 America/New_York
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

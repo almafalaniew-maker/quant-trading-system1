@@ -1,0 +1,7 @@
+# Alternative to systemd. Same cadence: once per weekday after the close.
+# Set the timezone explicitly - a server on UTC will fire at the wrong time.
+CRON_TZ=America/New_York
+
+30 16 * * 1-5 cd /opt/quant-trading-system1 && set -a && . ./.env && set +a && \
+  python3 fetch_bars.py --symbols-from bars/ >> session.log 2>&1 && \
+  python3 run_session.py --data ./bars --live >> session.log 2>&1

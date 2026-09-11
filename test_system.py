@@ -526,7 +526,8 @@ def test_session_manages_before_it_scans():
     import run_session as rs
     with tempfile.TemporaryDirectory() as tmp:
         cfg, broker, universe, prepared, bmarks, path, held = _session_fixture(tmp, bars_held=5)
-        code = rs.run_session(cfg, broker, universe, prepared, bmarks, path)
+        code = rs.run_session(cfg, broker, universe, prepared, bmarks, path,
+                              ledger_path=Path(tmp) / "ledger.json")
         check("session completes", code == 0, f"exit {code}")
         check("the timed-out position was closed before scanning",
               any("at market" in a for a in broker.actions), f"{broker.actions}")
@@ -544,7 +545,8 @@ def test_session_skips_the_scan_when_management_fails():
 
         broker.positions = explode
         before = len(broker.planned)
-        code = rs.run_session(cfg, broker, universe, prepared, bmarks, path)
+        code = rs.run_session(cfg, broker, universe, prepared, bmarks, path,
+                              ledger_path=Path(tmp) / "ledger.json")
         check("a management failure is reported as a failure", code == 1, f"exit {code}")
         check("no entry is attempted after a management failure",
               len(broker.planned) == before, f"{len(broker.planned)} planned")
@@ -556,7 +558,8 @@ def test_session_records_new_entries_for_the_next_run():
     import run_session as rs
     with tempfile.TemporaryDirectory() as tmp:
         cfg, broker, universe, prepared, bmarks, path, held = _session_fixture(tmp)
-        rs.run_session(cfg, broker, universe, prepared, bmarks, path)
+        rs.run_session(cfg, broker, universe, prepared, bmarks, path,
+                       ledger_path=Path(tmp) / "ledger.json")
         state = pm.load_state(path)
         check("the scan actually opened something to track",
               len(broker.planned) > 0, "no entries planned - assertions would be vacuous")
@@ -572,6 +575,224 @@ def test_session_records_new_entries_for_the_next_run():
             check("tracked entry carries the stop that was submitted",
                   approx(tracked.stop_price, p.stop_price),
                   f"{tracked.stop_price} vs {p.stop_price}")
+
+
+# ---------------------------------------------------------------------------
+# Live-trading safety rails
+# ---------------------------------------------------------------------------
+
+def _plan(symbol="TEST", shares=100, entry=100.0, stop=96.0, target=132.0, risk=400.0):
+    import trade_executor as te
+    return te.OrderPlan(symbol=symbol, shares=shares, entry_price=entry,
+                        stop_price=stop, take_profit_price=target,
+                        take_profit_shares=shares, trailed_shares=0,
+                        risk_dollars=risk, exit_mode="fixed_target")
+
+
+def test_halt_file_stops_everything():
+    import tempfile
+    import safety
+    with tempfile.TemporaryDirectory() as d:
+        halt = Path(d) / "HALT"
+        check("no halt file means clear", safety.check_halt_file(halt).passed)
+        halt.write_text("manual stop")
+        blocked = safety.check_halt_file(halt)
+        check("a halt file blocks the session",
+              not blocked.passed and "manual stop" in blocked.detail, f"{blocked}")
+
+
+def test_live_needs_both_switches():
+    import safety
+    check("dry run needs no authorisation",
+          safety.check_live_authorised(False, {}).passed)
+    check("the flag alone does not authorise live",
+          not safety.check_live_authorised(True, {}).passed)
+    check("the env var alone does not authorise live",
+          safety.check_live_authorised(False, {safety.LIVE_FLAG_ENV: "yes"}).passed)
+    check("flag plus env var authorises live",
+          safety.check_live_authorised(True, {safety.LIVE_FLAG_ENV: "yes"}).passed)
+
+
+def test_session_cannot_run_twice_in_one_day():
+    import safety
+    led = safety.Ledger(last_session_date="2026-09-11")
+    check("a second run on the same date is blocked",
+          not safety.check_already_ran_today(led, "2026-09-11").passed)
+    check("the next day is allowed",
+          safety.check_already_ran_today(led, "2026-09-14").passed)
+
+
+def test_drawdown_breakers_fire():
+    import safety
+    limits = safety.Limits(max_daily_loss_pct=0.06, max_total_drawdown_pct=0.30)
+    led = safety.Ledger(high_water=100_000.0, day_start_equity=100_000.0)
+    check("a normal day passes", safety.check_drawdown(98_000.0, led, limits).passed)
+    check("a 7% day trips the daily breaker",
+          not safety.check_drawdown(93_000.0, led, limits).passed)
+    deep = safety.Ledger(high_water=200_000.0, day_start_equity=140_000.0)
+    check("a 30% fall from high water trips the account breaker",
+          not safety.check_drawdown(139_000.0, deep, limits).passed)
+
+
+def test_order_validation_rejects_an_inverted_stop():
+    """The check that matters most: a stop at or above entry exits instantly."""
+    import safety
+    limits = safety.Limits()
+    check("a sane order passes", safety.validate_order(_plan(), 100_000.0, limits).passed)
+    check("a stop above entry is rejected",
+          not safety.validate_order(_plan(stop=101.0), 100_000.0, limits).passed)
+    check("a stop equal to entry is rejected",
+          not safety.validate_order(_plan(stop=100.0), 100_000.0, limits).passed)
+    check("a target below entry is rejected",
+          not safety.validate_order(_plan(target=99.0), 100_000.0, limits).passed)
+    check("zero shares is rejected",
+          not safety.validate_order(_plan(shares=0), 100_000.0, limits).passed)
+
+
+def test_order_validation_caps_position_size():
+    import safety
+    limits = safety.Limits(max_position_notional_pct=0.25)
+    # 100 shares at $100 is $10,000 - a quarter of a $40,000 account is the cap.
+    check("a position at the cap passes",
+          safety.validate_order(_plan(), 41_000.0, limits).passed)
+    check("an oversized position is rejected",
+          not safety.validate_order(_plan(), 30_000.0, limits).passed)
+    check("risking more than 5% on one trade is rejected",
+          not safety.validate_order(_plan(risk=6_000.0), 100_000.0, limits).passed)
+
+
+def test_portfolio_risk_is_capped_across_all_positions():
+    import safety
+    limits = safety.Limits(max_portfolio_risk_pct=0.10)
+    check("modest aggregate risk passes",
+          safety.check_portfolio_risk(5_000.0, 1_000.0, 100_000.0, limits).passed)
+    check("aggregate risk above the cap is blocked",
+          not safety.check_portfolio_risk(9_500.0, 1_000.0, 100_000.0, limits).passed)
+
+
+def test_preflight_blocks_live_without_credentials():
+    import safety
+    result = safety.preflight(
+        live=True, equity=100_000.0, open_count=0, clock=None,
+        ledger=safety.Ledger(), today="2026-09-11",
+        env={safety.LIVE_FLAG_ENV: "yes"}, halt_file=Path("/nonexistent-halt"))
+    check("preflight blocks live trading with no credentials",
+          not result.ok and any("credentials" in c.name for c in result.blockers),
+          f"{[str(c) for c in result.blockers]}")
+
+
+def test_preflight_passes_a_clean_dry_run():
+    import safety
+    result = safety.preflight(
+        live=False, equity=100_000.0, open_count=3, clock=None,
+        ledger=safety.Ledger(high_water=100_000.0, day_start_equity=100_000.0),
+        today="2026-09-11", env={}, halt_file=Path("/nonexistent-halt"))
+    check("a clean dry run passes preflight", result.ok,
+          f"{[str(c) for c in result.blockers]}")
+
+
+def test_session_refuses_a_second_run_on_the_same_day():
+    """The one-session-per-day rail, exercised through the whole runner.
+
+    A retry, an overlapping cron entry, or a scheduler firing twice would
+    otherwise open a second full set of positions on the same signals.
+    """
+    import tempfile
+    import run_session as rs
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, broker, universe, prepared, bmarks, path, held = _session_fixture(tmp)
+        ledger = Path(tmp) / "ledger.json"
+        first = rs.run_session(cfg, broker, universe, prepared, bmarks, path,
+                               ledger_path=ledger)
+        opened = len(broker.planned)
+        second = rs.run_session(cfg, broker, universe, prepared, bmarks, path,
+                                ledger_path=ledger)
+        check("the first session runs", first == 0, f"exit {first}")
+        check("the second session is blocked by preflight", second == 2, f"exit {second}")
+        check("the blocked session opens nothing",
+              len(broker.planned) == opened, f"{len(broker.planned)} vs {opened}")
+
+
+# ---------------------------------------------------------------------------
+# Market data refresh
+# ---------------------------------------------------------------------------
+
+class _FakeBar:
+    def __init__(self, day, o, h, l, c, v):
+        import datetime as _dt
+        self.timestamp = _dt.datetime.fromisoformat(day)
+        self.open, self.high, self.low, self.close, self.volume = o, h, l, c, v
+
+
+class _FakeDataClient:
+    """Stands in for Alpaca's data client, which is unreachable from here."""
+
+    def __init__(self, series):
+        self.series = series
+        self.requests = []
+
+    def get_stock_bars(self, request):
+        self.requests.append(request)
+        symbol = request.symbol_or_symbols
+
+        class _Resp:
+            pass
+
+        r = _Resp()
+        r.data = {symbol: self.series.get(symbol, [])}
+        return r
+
+
+def test_fetch_merges_incrementally_without_duplicating():
+    import tempfile
+    import fetch_bars
+    with tempfile.TemporaryDirectory() as d:
+        bars = Path(d)
+        (bars / "TEST.csv").write_text(
+            "date,open,high,low,close,volume\n"
+            "2026-09-08,10,11,9,10.5,1000\n"
+            "2026-09-09,10.5,12,10,11.5,1200\n")
+        client = _FakeDataClient({"TEST": [
+            _FakeBar("2026-09-09", 10.5, 12, 10, 11.5, 1200),   # overlap
+            _FakeBar("2026-09-10", 11.5, 13, 11, 12.5, 1300),   # new
+        ], "SPY": [], "QQQ": []})
+        fetch_bars.refresh(["TEST"], client, bars)
+        out = pd.read_csv(bars / "TEST.csv", dtype={"date": str})
+        check("overlapping bars are not duplicated", len(out) == 3, f"{len(out)} rows")
+        check("the new bar is appended", out["date"].iloc[-1] == "2026-09-10",
+              out["date"].iloc[-1])
+        check("dates stay ordered", out["date"].is_monotonic_increasing)
+
+
+def test_fetch_refuses_to_write_impossible_bars():
+    """A vendor response with a low above the open would let the backtester
+    fill at a price that never traded. Catch it at the boundary."""
+    import tempfile
+    import fetch_bars
+    with tempfile.TemporaryDirectory() as d:
+        bars = Path(d)
+        client = _FakeDataClient({"BAD": [_FakeBar("2026-09-10", 10, 11, 12, 10.5, 100)]})
+        fetch_bars.refresh(["BAD"], client, bars)
+        check("a file with impossible bars is never written",
+              not (bars / "BAD.csv").exists())
+
+
+def test_fetch_survives_one_bad_symbol():
+    import tempfile
+    import fetch_bars
+
+    class _Flaky(_FakeDataClient):
+        def get_stock_bars(self, request):
+            if request.symbol_or_symbols == "BOOM":
+                raise RuntimeError("vendor error")
+            return super().get_stock_bars(request)
+
+    with tempfile.TemporaryDirectory() as d:
+        bars = Path(d)
+        client = _Flaky({"GOOD": [_FakeBar("2026-09-10", 10, 11, 9, 10.5, 100)]})
+        added = fetch_bars.refresh(["BOOM", "GOOD"], client, bars)
+        check("a failing symbol does not stop the run", "GOOD" in added, f"{added}")
+        check("the healthy symbol is written", (bars / "GOOD.csv").exists())
 
 
 def main() -> int:
@@ -607,6 +828,19 @@ def main() -> int:
         test_session_manages_before_it_scans,
         test_session_skips_the_scan_when_management_fails,
         test_session_records_new_entries_for_the_next_run,
+        test_halt_file_stops_everything,
+        test_live_needs_both_switches,
+        test_session_cannot_run_twice_in_one_day,
+        test_drawdown_breakers_fire,
+        test_order_validation_rejects_an_inverted_stop,
+        test_order_validation_caps_position_size,
+        test_portfolio_risk_is_capped_across_all_positions,
+        test_preflight_blocks_live_without_credentials,
+        test_preflight_passes_a_clean_dry_run,
+        test_session_refuses_a_second_run_on_the_same_day,
+        test_fetch_merges_incrementally_without_duplicating,
+        test_fetch_refuses_to_write_impossible_bars,
+        test_fetch_survives_one_bad_symbol,
     ]
     for test in tests:
         print(f"\n{test.__name__}")

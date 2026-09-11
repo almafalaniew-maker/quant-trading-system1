@@ -1,0 +1,30 @@
+[Unit]
+Description=Quant trading system - one daily session
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+WorkingDirectory=/opt/quant-trading-system1
+EnvironmentFile=/opt/quant-trading-system1/.env
+
+# Refresh bars first. If the data is stale the session must not run at all -
+# trading yesterday's breakouts on today's account is worse than not trading.
+ExecStartPre=/usr/bin/env python3 fetch_bars.py --symbols-from bars/
+ExecStart=/usr/bin/env python3 run_session.py --data ./bars --live
+
+# A failed session must not silently retry into a double-trade; the
+# one-session-per-day ledger would block it anyway, but be explicit.
+Restart=no
+StandardOutput=append:/opt/quant-trading-system1/session.log
+StandardError=append:/opt/quant-trading-system1/session.log
+
+# The process only needs its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/quant-trading-system1
+
+[Install]
+WantedBy=multi-user.target
