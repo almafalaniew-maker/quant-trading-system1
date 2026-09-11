@@ -223,3 +223,52 @@ def size_position(
         risk_dollars=shares * risk_per_share,
         notional=shares * entry_price,
     )
+
+
+# ---------------------------------------------------------------------------
+# Named presets
+# ---------------------------------------------------------------------------
+# The configurations that survived testing, so what runs live is addressed by
+# name rather than reassembled from flags each time. Every one of these uses
+# 1.0% risk: 1.5% and 2.0% made less money in every window tested, because
+# larger positions consume cash and crowd out later signals.
+
+PRESETS: dict[str, "StrategyConfig"] = {
+    # Best drawdown-adjusted return, and it does not depend on the gap filter -
+    # which wins over five years but loses over sixteen and nearly doubles
+    # drawdown there. The recommended default for that reason.
+    "balanced": StrategyConfig(
+        name="balanced", target_r=8.0, gap_mode="ignored", atr_stop_mult=2.0,
+        max_hold_bars=250, risk_pct=0.010, max_open_positions=15),
+
+    # Highest return over the trailing five years (34.0% cagr, 25.7% drawdown).
+    # Robust across opening balances, but it rests on the gap filter.
+    "max-return-5y": StrategyConfig(
+        name="max-return-5y", target_r=8.0, gap_mode="required", min_gap_pct=0.025,
+        atr_stop_mult=1.5, max_hold_bars=250, risk_pct=0.010, max_open_positions=15),
+
+    # Best fixed setting over 2011-2026: most money AND the smallest drawdown
+    # of every candidate in that comparison.
+    "max-return-16y": StrategyConfig(
+        name="max-return-16y", target_r=8.0, gap_mode="ignored", atr_stop_mult=1.5,
+        max_hold_bars=250, risk_pct=0.010, max_open_positions=15),
+
+    # Smallest position size. Less money in every window, but the shallowest
+    # equity dips - the one to run while you are still learning to sit through
+    # a losing streak.
+    "conservative": StrategyConfig(
+        name="conservative", target_r=8.0, gap_mode="ignored", atr_stop_mult=2.0,
+        max_hold_bars=250, risk_pct=0.005, max_open_positions=15),
+}
+
+DEFAULT_PRESET = "balanced"
+
+
+def preset(name: str) -> "StrategyConfig":
+    """Look up a preset by name, with a useful error when it is missing."""
+    try:
+        return PRESETS[name]
+    except KeyError:
+        raise SystemExit(
+            f"unknown strategy {name!r}; choose from {', '.join(sorted(PRESETS))}"
+        ) from None

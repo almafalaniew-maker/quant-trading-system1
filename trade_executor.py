@@ -31,7 +31,10 @@ from typing import Protocol
 import pandas as pd
 
 import indicators as ind
-from strategy import StrategyConfig, prepare_symbol, regime_series, size_position
+from strategy import (
+    DEFAULT_PRESET, PRESETS, StrategyConfig, prepare_symbol,
+    preset, regime_series, size_position,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -40,23 +43,29 @@ from strategy import StrategyConfig, prepare_symbol, regime_series, size_positio
 
 @dataclass
 class OrderPlan:
-    """Everything needed to place one bracketed entry, computed before any fill."""
+    """Everything needed to place one bracketed entry, computed before any fill.
+
+    `take_profit_shares` is the size that rests on a limit order. Under a fixed
+    target that is the whole position; under a scale-out it is only the tranche,
+    and the remainder is managed by the trailing stop.
+    """
     symbol: str
     shares: int
     entry_price: float
     stop_price: float
-    scale_target: float
-    scale_shares: int
-    runner_shares: int
+    take_profit_price: float
+    take_profit_shares: int
+    trailed_shares: int
     risk_dollars: float
+    exit_mode: str
 
     def describe(self) -> str:
-        return (
-            f"{self.symbol}: {self.shares} @ ~{self.entry_price:.2f} "
-            f"| stop {self.stop_price:.2f} (risk ${self.risk_dollars:,.0f}) "
-            f"| scale {self.scale_shares} @ {self.scale_target:.2f} "
-            f"| runner {self.runner_shares} trails"
-        )
+        head = (f"{self.symbol}: {self.shares} @ ~{self.entry_price:.2f} "
+                f"| stop {self.stop_price:.2f} (risk ${self.risk_dollars:,.0f})")
+        if self.exit_mode == "fixed_target":
+            return f"{head} | target {self.take_profit_shares} @ {self.take_profit_price:.2f}"
+        return (f"{head} | scale {self.take_profit_shares} @ {self.take_profit_price:.2f} "
+                f"| runner {self.trailed_shares} trails")
 
 
 class Broker(Protocol):
@@ -120,10 +129,14 @@ class AlpacaBroker:
             symbol=plan.symbol, qty=plan.shares, side=OrderSide.SELL,
             time_in_force=TimeInForce.GTC, stop_price=round(plan.stop_price, 2),
         ))
-        if plan.scale_shares > 0:
+        # The take-profit must be placed for every exit mode. Gating it on a
+        # scale-out tranche left the fixed-target presets - which are the tested
+        # ones - running live with a stop and no profit target at all.
+        if plan.take_profit_shares > 0:
             self.client.submit_order(order_data=LimitOrderRequest(
-                symbol=plan.symbol, qty=plan.scale_shares, side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC, limit_price=round(plan.scale_target, 2),
+                symbol=plan.symbol, qty=plan.take_profit_shares, side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                limit_price=round(plan.take_profit_price, 2),
             ))
         return str(entry.id)
 
@@ -182,19 +195,27 @@ def plan_order(hit: dict, equity: float, cfg: StrategyConfig) -> OrderPlan | Non
     if sizing is None:
         return None
 
-    scale_shares = 0
-    if cfg.exit_mode == "scale_out":
-        scale_shares = min(sizing.shares, max(1, int(round(sizing.shares * cfg.scale_fraction))))
+    if cfg.exit_mode == "fixed_target":
+        # The whole position rests at target_r; nothing is trailed.
+        take_profit_price = hit["price"] + cfg.target_r * sizing.risk_per_share
+        take_profit_shares = sizing.shares
+    else:
+        take_profit_price = hit["price"] + cfg.scale_r * sizing.risk_per_share
+        take_profit_shares = (
+            min(sizing.shares, max(1, int(round(sizing.shares * cfg.scale_fraction))))
+            if cfg.scale_fraction > 0 else 0
+        )
 
     return OrderPlan(
         symbol=hit["symbol"],
         shares=sizing.shares,
         entry_price=hit["price"],
         stop_price=sizing.stop_price,
-        scale_target=hit["price"] + cfg.scale_r * sizing.risk_per_share,
-        scale_shares=scale_shares,
-        runner_shares=sizing.shares - scale_shares,
+        take_profit_price=take_profit_price,
+        take_profit_shares=take_profit_shares,
+        trailed_shares=sizing.shares - take_profit_shares,
         risk_dollars=sizing.risk_dollars,
+        exit_mode=cfg.exit_mode,
     )
 
 
@@ -228,6 +249,8 @@ def trade_once(universe, benchmarks, broker: Broker, cfg: StrategyConfig) -> lis
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Run one scan-and-trade pass.")
     parser.add_argument("--data", required=True, help="directory of <SYMBOL>.csv daily bars")
+    parser.add_argument("--strategy", default=DEFAULT_PRESET, choices=sorted(PRESETS),
+                        help=f"named preset to run (default: {DEFAULT_PRESET})")
     parser.add_argument("--live", action="store_true",
                         help="actually submit orders (requires ALPACA_API_KEY/SECRET)")
     parser.add_argument("--paper", action="store_true", default=True)
@@ -244,13 +267,18 @@ def main(argv=None) -> int:
 
     import data as data_mod
 
-    cfg = StrategyConfig(
-        name="live",
-        gap_mode="required" if args.gap_required else "ignored",
-        min_gap_pct=args.min_gap,
-        exit_mode="scale_out" if args.scale_out else "fixed_target",
-        regime_mode="dual_index_strict" if args.strict_regime else "spy_sma",
-    )
+    # Start from the tested preset; the flags below only override it when the
+    # caller explicitly asks, so the live config stays the backtested one.
+    cfg = preset(args.strategy)
+    overrides = {}
+    if args.gap_required:
+        overrides.update(gap_mode="required", min_gap_pct=args.min_gap)
+    if args.scale_out:
+        overrides.update(exit_mode="scale_out")
+    if args.strict_regime:
+        overrides.update(regime_mode="dual_index_strict")
+    if overrides:
+        cfg = cfg.variant(f"{cfg.name}+overrides", **overrides)
 
     frames = data_mod.load_csv_dir(args.data)
     benchmarks = {t: frames.pop(t) for t in ("SPY", "QQQ") if t in frames}

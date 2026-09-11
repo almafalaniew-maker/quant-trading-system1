@@ -36,6 +36,31 @@ The data directory wants one `<SYMBOL>.csv` per name with `date,open,high,low,
 close,volume` columns, adjusted for splits. `SPY.csv` is required for the regime
 gate; `QQQ.csv` is required for the strict dual-index regime.
 
+## Running a strategy
+
+Configurations that survived testing are named presets, so what runs live is
+addressed by name rather than reassembled from flags:
+
+| preset | target | gap | stop | risk | notes |
+| --- | --- | --- | --- | --- | --- |
+| `balanced` *(default)* | 8R | none | 2.0xATR | 1.0% | best drawdown-adjusted return; does not depend on the gap filter |
+| `max-return-5y` | 8R | >=2.5% | 1.5xATR | 1.0% | most money over 2021-2026 (34.0% cagr, 25.7% drawdown) |
+| `max-return-16y` | 8R | none | 1.5xATR | 1.0% | best fixed setting over 2011-2026 - most money *and* smallest drawdown |
+| `conservative` | 8R | none | 2.0xATR | 0.5% | less money in every window, shallowest dips |
+
+```bash
+python3 trade_executor.py --data ./bars                          # dry run, balanced
+python3 trade_executor.py --data ./bars --strategy max-return-5y # dry run, another preset
+python3 trade_executor.py --data ./bars --live                   # sends real orders
+```
+
+All presets risk **1.0%** per trade. 1.5% and 2.0% made *less* money in every
+window tested: larger positions consume cash and crowd out later signals.
+
+The gap filter is deliberately off by default. It wins over 2021-2026 and loses
+over 2011-2026, where it also nearly doubles drawdown (37.3% vs 19.9%). Until
+that disagreement is resolved, the default does not depend on it.
+
 ## Configuration
 
 Each testable idea is a field on `StrategyConfig`, so a variant is a config

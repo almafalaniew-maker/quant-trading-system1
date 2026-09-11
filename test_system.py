@@ -348,6 +348,36 @@ def test_hold_limit_counts_bars_not_calendar_days():
           f"{position.legs[-1].reason if position.legs else 'none'}")
 
 
+def test_live_plan_sets_a_profit_target_for_fixed_target_presets():
+    """A fixed-target preset must rest the whole position at target_r.
+
+    The take-profit used to be gated on a scale-out tranche, so the tested
+    presets would have gone live carrying a stop and no profit target.
+    """
+    import trade_executor as te
+    from strategy import preset
+
+    cfg = preset("balanced")                      # fixed_target, 8R
+    hit = {"symbol": "TEST", "price": 100.0, "gap_pct": 0.0, "atr": 2.0,
+           "stop_distance": 4.0, "adv_dollars": 5e7}
+    plan = te.plan_order(hit, 100_000.0, cfg)
+    expected = 100.0 + cfg.target_r * 4.0
+    check("fixed-target plan rests the full size at target_r",
+          plan is not None and plan.take_profit_shares == plan.shares
+          and approx(plan.take_profit_price, expected),
+          f"{plan.take_profit_shares}/{plan.shares} @ {plan.take_profit_price}")
+    check("fixed-target plan trails nothing", plan.trailed_shares == 0,
+          f"{plan.trailed_shares}")
+
+
+def test_presets_are_the_tested_configurations():
+    from strategy import PRESETS, DEFAULT_PRESET
+    ok = all(c.exit_mode == "fixed_target" and c.target_r == 8.0
+             and c.max_hold_bars == 250 for c in PRESETS.values())
+    check("every preset is an 8R / 250-bar fixed-target config", ok)
+    check("the default preset exists", DEFAULT_PRESET in PRESETS)
+
+
 def main() -> int:
     tests = [
         test_no_lookahead,
@@ -370,6 +400,8 @@ def main() -> int:
         test_short_cash_takes_a_smaller_position,
         test_partial_fill_keeps_r_accounting_honest,
         test_hold_limit_counts_bars_not_calendar_days,
+        test_live_plan_sets_a_profit_target_for_fixed_target_presets,
+        test_presets_are_the_tested_configurations,
     ]
     for test in tests:
         print(f"\n{test.__name__}")
