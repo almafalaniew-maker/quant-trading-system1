@@ -17,6 +17,7 @@ behaviour cannot quietly drift away from what was tested.
 | `data.py` | CSV / yfinance loaders and a synthetic generator for tests |
 | `ab_test.py` | Runs the baseline against one-change-at-a-time variants |
 | `trade_executor.py` | Live/paper execution, dry-run by default |
+| `position_manager.py` | Reconciles open positions, trails stops, applies the time stop |
 | `test_system.py` | Mechanics self-tests |
 
 ## Running
@@ -53,6 +54,23 @@ python3 trade_executor.py --data ./bars                          # dry run, bala
 python3 trade_executor.py --data ./bars --strategy max-return-5y # dry run, another preset
 python3 trade_executor.py --data ./bars --live                   # sends real orders
 ```
+
+Entries are only half the job. `trade_executor` attaches a stop and a
+take-profit as two independent orders, and nothing cancels the sibling when one
+of them fills - a filled target leaves a live stop for shares that are gone, and
+if it triggers the account ends up short. `position_manager` is what closes
+that hole, and it also owns the two exit rules a broker cannot express: the
+250-bar time stop and the trailing stop. Run it once per session after the
+close, with the same preset:
+
+```bash
+python3 position_manager.py --data ./bars                     # dry run
+python3 position_manager.py --data ./bars --live              # acts on the account
+```
+
+It keeps state in `positions_state.json` - the broker knows the share count but
+not what defined 1R, how many bars a trade has been open, or how high it has
+run - so the file must persist between runs.
 
 All presets risk **1.0%** per trade. 1.5% and 2.0% made *less* money in every
 window tested: larger positions consume cash and crowd out later signals.

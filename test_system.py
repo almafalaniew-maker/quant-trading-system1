@@ -9,6 +9,8 @@ Run with:  python3 test_system.py
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -378,6 +380,121 @@ def test_presets_are_the_tested_configurations():
     check("the default preset exists", DEFAULT_PRESET in PRESETS)
 
 
+# ---------------------------------------------------------------------------
+# Position management
+# ---------------------------------------------------------------------------
+
+def _managed(symbol="TEST", shares=100, entry=100.0, risk=4.0, stop=96.0,
+             high=100.0, bars=0):
+    from position_manager import ManagedPosition
+    return ManagedPosition(symbol=symbol, entry_date="2026-01-05", entry_price=entry,
+                           shares=shares, risk_per_share=risk, stop_price=stop,
+                           highest_high=high, bars_held=bars,
+                           stop_order_id="stop-0", target_order_id="tgt-0")
+
+
+def _bars_frame(high=100.0, atr=2.0, n=1):
+    idx = pd.bdate_range("2026-06-01", periods=n)
+    return pd.DataFrame({"open": high, "high": high, "low": high * 0.98,
+                         "close": high, "atr": atr}, index=idx)
+
+
+def test_orphaned_stop_is_cancelled_when_the_target_filled():
+    """The defect that makes a separate stop and target dangerous.
+
+    Target fills, position goes to zero, and the stop order is still live. If it
+    ever triggers the account is short a stock it never meant to sell.
+    """
+    from position_manager import (BrokerOrder, ManagedDryRunBroker, PositionManager)
+    broker = ManagedDryRunBroker(
+        positions={"TEST": 0},
+        orders=[BrokerOrder("stop-0", "TEST", "stop", 100, 96.0)])
+    mgr = PositionManager(StrategyConfig(), broker, {})
+    state = mgr.reconcile({"TEST": _managed()})
+    check("closed position drops out of state", "TEST" not in state)
+    check("its orphaned stop order is cancelled",
+          broker.open_orders("TEST") == [], f"{broker.open_orders('TEST')}")
+
+
+def test_partial_fill_reprotects_the_remaining_shares():
+    from position_manager import (BrokerOrder, ManagedDryRunBroker, PositionManager)
+    broker = ManagedDryRunBroker(
+        positions={"TEST": 40},
+        orders=[BrokerOrder("stop-0", "TEST", "stop", 100, 96.0),
+                BrokerOrder("tgt-0", "TEST", "limit", 100, 132.0)])
+    mgr = PositionManager(StrategyConfig(), broker, {})
+    state = mgr.reconcile({"TEST": _managed(shares=100)})
+    stops = [o for o in broker.open_orders("TEST") if o.kind == "stop"]
+    check("state resizes to the shares actually held", state["TEST"].shares == 40)
+    check("the stop is re-submitted for the remaining size",
+          len(stops) == 1 and stops[0].qty == 40, f"{stops}")
+    check("the take-profit is left alone",
+          any(o.kind == "limit" for o in broker.open_orders("TEST")))
+
+
+def test_untracked_position_is_reported_not_silently_managed():
+    from position_manager import ManagedDryRunBroker, PositionManager
+    broker = ManagedDryRunBroker(positions={"WILD": 50})
+    mgr = PositionManager(StrategyConfig(), broker, {})
+    mgr.reconcile({})
+    check("an unknown holding is flagged for a human",
+          any("no tracked state" in m for m in mgr.log), f"{mgr.log}")
+
+
+def test_time_stop_closes_the_position_and_cancels_its_orders():
+    from position_manager import (BrokerOrder, ManagedDryRunBroker, PositionManager)
+    cfg = StrategyConfig(max_hold_bars=3)
+    broker = ManagedDryRunBroker(
+        positions={"TEST": 100},
+        orders=[BrokerOrder("stop-0", "TEST", "stop", 100, 96.0),
+                BrokerOrder("tgt-0", "TEST", "limit", 100, 132.0)])
+    frame = _bars_frame()
+    mgr = PositionManager(cfg, broker, {"TEST": frame})
+    state = {"TEST": _managed(bars=2)}
+    mgr.advance(state, frame.index[-1])
+    check("time stop removes the position from state", "TEST" not in state)
+    check("time stop sells at market",
+          any("at market" in a for a in broker.actions), f"{broker.actions}")
+    check("time stop cancels the resting orders", broker.open_orders("TEST") == [])
+
+
+def test_trailing_stop_only_ever_rises():
+    from position_manager import (BrokerOrder, ManagedDryRunBroker, PositionManager)
+    cfg = StrategyConfig(trail_from_r=1.0, trail_atr_mult=2.0, max_hold_bars=999)
+    broker = ManagedDryRunBroker(
+        positions={"TEST": 100},
+        orders=[BrokerOrder("stop-0", "TEST", "stop", 100, 96.0)])
+    frame = _bars_frame(high=120.0, atr=2.0)
+    mgr = PositionManager(cfg, broker, {"TEST": frame})
+    pos = _managed()
+    state = {"TEST": pos}
+    mgr.advance(state, frame.index[-1])
+    raised = pos.stop_price
+    check("trail arms past its threshold and raises the stop",
+          pos.trailing and raised > 96.0, f"stop {raised}")
+
+    # A quiet bar must not pull the stop back down.
+    calm = _bars_frame(high=105.0, atr=8.0)
+    mgr2 = PositionManager(cfg, broker, {"TEST": calm})
+    mgr2.advance({"TEST": pos}, calm.index[-1])
+    check("a later bar never lowers the stop", pos.stop_price >= raised,
+          f"{raised} -> {pos.stop_price}")
+
+
+def test_state_survives_a_restart():
+    import tempfile
+    from position_manager import load_state, save_state
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "state.json"
+        original = {"TEST": _managed(shares=77, bars=12, high=143.5)}
+        save_state(original, path)
+        restored = load_state(path)
+        check("persisted state round-trips",
+              restored["TEST"].shares == 77 and restored["TEST"].bars_held == 12
+              and restored["TEST"].highest_high == 143.5)
+    check("a missing state file reads as empty", load_state(Path("/nonexistent.json")) == {})
+
+
 def main() -> int:
     tests = [
         test_no_lookahead,
@@ -402,6 +519,12 @@ def main() -> int:
         test_hold_limit_counts_bars_not_calendar_days,
         test_live_plan_sets_a_profit_target_for_fixed_target_presets,
         test_presets_are_the_tested_configurations,
+        test_orphaned_stop_is_cancelled_when_the_target_filled,
+        test_partial_fill_reprotects_the_remaining_shares,
+        test_untracked_position_is_reported_not_silently_managed,
+        test_time_stop_closes_the_position_and_cancels_its_orders,
+        test_trailing_stop_only_ever_rises,
+        test_state_survives_a_restart,
     ]
     for test in tests:
         print(f"\n{test.__name__}")
