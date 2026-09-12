@@ -25,6 +25,23 @@ strategy running automatically.
 - An Alpaca account and a **paper** key pair
 - Roughly 20MB of disk for bars and logs
 
+## Quick install
+
+`setup.sh` does the prerequisite checks, self-tests, account check and data pull
+in one pass:
+
+```bash
+cp .env.example .env && chmod 600 .env && $EDITOR .env   # add your keys
+./setup.sh --install
+```
+
+It refuses to continue if Python is too old, `.env` is missing a key, the
+self-tests fail, or Alpaca cannot be reached - so a broken host fails at setup
+rather than at 16:30 on a trading day. Re-run `./setup.sh` (without `--install`)
+any time as a health check.
+
+The manual steps below are the same thing, one at a time.
+
 ## Install
 
 ```bash
